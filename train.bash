@@ -1,0 +1,1 @@
+python ./entry.py --mode=train --data_path=../hw3-data-release --validation_ratio=0.2
