@@ -7,6 +7,7 @@ from torchvision.transforms import v2 as T
 from torchvision.transforms.v2 import functional as tfunc2
 from torchvision.transforms import InterpolationMode
 from torchvision.datasets import CocoDetection, wrap_dataset_for_transforms_v2
+from torchvision.ops import masks_to_boxes
 from torch.utils.data import Dataset, DataLoader
 from scipy.optimize import linear_sum_assignment
 
@@ -30,7 +31,10 @@ import time
 import os
 import math
 
-from utils import encode_mask as rle_encode, decode_maskobj as rle_decode_maskobj, read_maskfile as rle_read_maskfile, get_maskobj_instances as rle_maskobj_get_instances
+from utils import encode_mask as rle_encode
+from utils import decode_maskobj as rle_decode_maskobj
+from utils import read_maskfile as rle_read_maskfile
+from utils import get_maskobj_instances as rle_maskobj_get_instances
 
 
 
@@ -77,58 +81,78 @@ def parse_cmd():
 
 class ImageDataset(Dataset):
     def __init__(self, root_dir=None, transforms=None):
-        if root_dir != None:
-            self.root_dir = root_dir
-            self.transforms = transforms
+        self.root_dir = root_dir
+        self.transforms = transforms
 
-            self.sample_paths = sorted([f for f in os.listdir(root_dir) if os.path.isdir(self.root_dir + '/' + f)])
+        self.sample_paths = sorted(
+            [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
+        )
+
+        # 0 is background for torchvision detection models
+        self.class_to_label = {"class1": 1,"class2": 2,"class3": 3,"class4": 4}
+        self.label_to_class = ["bg","class1","class2","class3","class4"]
 
     def __len__(self):
         return len(self.sample_paths)
 
     def __getitem__(self, idx):
-        sample_path = self.root_dir + "/" + self.sample_paths[idx]
+        sample_path = os.path.join(self.root_dir, self.sample_paths[idx])
 
-        file_paths = [f for f in os.listdir(sample_path)]
-        image_path = [sample_path + '/' + f for f in file_paths if f.startswith("image")][0]
-        class_paths = [sample_path + '/' + f for f in file_paths if f.startswith("class")]
+        file_paths = os.listdir(sample_path)
+        image_path = [os.path.join(sample_path, f) for f in file_paths if f.startswith("image")][0]
+        class_paths = [os.path.join(sample_path, f) for f in file_paths if f.startswith("class")]
 
-        sample_id = self.sample_paths[idx]
-        
         with Image.open(image_path) as img:
+            img = img.convert("RGB")
             orig_w, orig_h = img.size
 
             if self.transforms is not None:
                 image = self.transforms(img)
             else:
-                image = img
+                image = tfunc2.to_tensor(img)
 
-        targets = []
-        
+        all_masks = []
+        all_labels = []
 
         for instance_mask_path in class_paths:
-            class_name = instance_mask_path.split('/')[-1].split('.')[0]
-            if self.transforms is not None:
-                mask_img = self.transforms(rle_read_maskfile(instance_mask_path))
-            else:
-                mask_img = rle_read_maskfile(instance_mask_path)
+            class_name = os.path.basename(instance_mask_path).split(".")[0]
+            class_label = self.class_to_label[class_name]
 
-            mask_instances = rle_maskobj_get_instances(mask_img)
-            target_class = {
-                "class_id": class_name,
-                "mask_img": mask_img,
-                "instance_arr": mask_instances
-            }
-            targets.append(target_class)
+            mask_img = rle_read_maskfile(instance_mask_path)
 
-        
+            instance_masks = rle_maskobj_get_instances(mask_img)
+
+            for m_idx in instance_masks:
+                m = torch.as_tensor(mask_img == m_idx, dtype=torch.uint8)
+                if m.sum() == 0:
+                    continue
+                all_masks.append(m)
+                all_labels.append(class_label)
+
+        if len(all_masks) == 0:
+            masks = torch.zeros((0, orig_h, orig_w), dtype=torch.uint8)
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+            area = torch.zeros((0,), dtype=torch.float32)
+            iscrowd = torch.zeros((0,), dtype=torch.int64)
+        else:
+            masks = torch.stack(all_masks, dim=0)                  # [N, H, W]
+            labels = torch.tensor(all_labels, dtype=torch.int64)   # [N]
+            boxes = masks_to_boxes(masks)          # [N, 4]
+            area = masks.flatten(1).sum(dim=1).to(torch.float32)   # [N]
+            iscrowd = torch.zeros((masks.shape[0],), dtype=torch.int64)
+
         target = {
-            "sample_id": sample_id,
-            "orig_size": (orig_w, orig_h),
-            "masks": targets
+            "boxes": boxes,
+            "labels": labels,
+            "masks": masks,
+            "image_id": torch.tensor([idx], dtype=torch.int64),
+            "area": area,
+            "iscrowd": iscrowd,
+            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
+            "sample_id": self.sample_paths[idx]
         }
 
-        
         return image, target
     
     def split(self, split_items):
@@ -168,10 +192,12 @@ def get_dataset_statistics(dataset):
     image_counts = {'class1':0, 'class2':0, 'class3': 0, 'class4': 0}
     class_basis_map = {'class1':0, 'class2':1, 'class3': 2, 'class4': 3}
     image_vectors = {}
+
     for image, target in dataset:
         width, height = target['orig_size']
         instances = 0
         image_vectors[target['sample_id']] = [0,0,0,0]
+        if target
         for mask in target['masks']:
             mask_instances = len(mask['instance_arr'])
             image_vectors[target['sample_id']][class_basis_map[mask['class_id']]] = 1
@@ -238,52 +264,58 @@ if __name__=='__main__':
     data_path = Path("/".join([args.data_path, 'train']))
     
     training_dataset = ImageDataset(str(data_path))
-
+    image, target = training_dataset[0]
+    print(type(image), image.shape, image.dtype)
+    for k, v in target.items():
+        if isinstance(v, torch.Tensor):
+            print(k, v.shape, v.dtype)
+        else:
+            print(k, type(v), v)
     
     
     image_vectors = get_dataset_statistics(training_dataset)
-    sums = sum_dataset(image_vectors)
-    even_split_goal = []
-    for i in range(4):
-        even_split_goal.append(sums[i] * args.validation_ratio)
+    # sums = sum_dataset(image_vectors)
+    # even_split_goal = []
+    # for i in range(4):
+    #     even_split_goal.append(sums[i] * args.validation_ratio)
     
-    val_image_count = len(training_dataset) * args.validation_ratio
-    print(f"Want { \
-        math.ceil(val_image_count)} validation images having [class1,class2,class3,class4] totals exceeding {[math.floor(t) for t in even_split_goal]}")
+    # val_image_count = len(training_dataset) * args.validation_ratio
+    # print(f"Want { \
+    #     math.ceil(val_image_count)} validation images having [class1,class2,class3,class4] totals exceeding {[math.floor(t) for t in even_split_goal]}")
 
-    training_items = image_vectors
-    validation_items = []
-    for i in range(10):
-        next_choice = training_items.pop(random.randint(0,len(training_items)))
-        validation_items.append(next_choice)
-        for x in range(4):
-            sums[x] -= next_choice[1][x]
+    # training_items = image_vectors
+    # validation_items = []
+    # for i in range(10):
+    #     next_choice = training_items.pop(random.randint(0,len(training_items)))
+    #     validation_items.append(next_choice)
+    #     for x in range(4):
+    #         sums[x] -= next_choice[1][x]
     
-    valid_sum = sum_dataset(validation_items)
+    # valid_sum = sum_dataset(validation_items)
     
-    progress = get_progress(valid_sum, even_split_goal)
-    remaining = val_image_count - 10
-    while min(progress) < 1.0 or remaining > 0:
-        direction = progress.index(min(progress))
+    # progress = get_progress(valid_sum, even_split_goal)
+    # remaining = val_image_count - 10
+    # while min(progress) < 1.0 or remaining > 0:
+    #     direction = progress.index(min(progress))
         
-        training_items = sorted(training_items, key=lambda x: x[1][direction], reverse=True)
-        next_choice = training_items.pop(random.randint(0,sums[direction]))
-        validation_items.append(next_choice)
-        for x in range(4):
-            sums[x] -= next_choice[1][x]
-            valid_sum[x] += next_choice[1][x]
-        remaining -= 1
-        progress = get_progress(valid_sum, even_split_goal)
+    #     training_items = sorted(training_items, key=lambda x: x[1][direction], reverse=True)
+    #     next_choice = training_items.pop(random.randint(0,sums[direction]))
+    #     validation_items.append(next_choice)
+    #     for x in range(4):
+    #         sums[x] -= next_choice[1][x]
+    #         valid_sum[x] += next_choice[1][x]
+    #     remaining -= 1
+    #     progress = get_progress(valid_sum, even_split_goal)
 
-    print("Random Dataset Split Totals:")
-    print(f"\tvalidation dataset {len(validation_items)} items, class totals: {sum_dataset(validation_items)}")
-    print(f"\ttraining dataset {len(training_items)} items, class totals: {sum_dataset(training_items)}")
+    # print("Random Dataset Split Totals:")
+    # print(f"\tvalidation dataset {len(validation_items)} items, class totals: {sum_dataset(validation_items)}")
+    # print(f"\ttraining dataset {len(training_items)} items, class totals: {sum_dataset(training_items)}")
     
-    validation_dataset = training_dataset.split(validation_items)
+    # validation_dataset = training_dataset.split(validation_items)
 
-    print("Validation Dataset Statistics")
-    get_dataset_statistics(validation_dataset)
-    print("Training Dataset Statistics")
-    get_dataset_statistics(training_dataset)
+    # print("Validation Dataset Statistics")
+    # get_dataset_statistics(validation_dataset)
+    # print("Training Dataset Statistics")
+    # get_dataset_statistics(training_dataset)
 
-    print(len(training_dataset) + len(validation_dataset))
+    # print(len(training_dataset) + len(validation_dataset))
