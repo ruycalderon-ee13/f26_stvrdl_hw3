@@ -654,15 +654,18 @@ if __name__=='__main__':
     validation_dataset.crop_trials = 1
     validation_dataset.min_instances_in_crop = 0
 
+    print("creating model")
     model = get_instance_segmenter(5)
     model.to(device)
 
+    print("creating optimizer")
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=1e-4,
         weight_decay=1e-4,
     )
 
+    print("creating training loader")
     train_loader = DataLoader(
         training_dataset,
         batch_size=1,
@@ -670,7 +673,7 @@ if __name__=='__main__':
         num_workers=0,
         collate_fn=collate_fn,
     )
-
+    print("creating validation loader")
     val_loader = DataLoader(
         validation_dataset,
         batch_size=1,
@@ -679,8 +682,7 @@ if __name__=='__main__':
         collate_fn=collate_fn,
     )
 
-    quit()
-
+    print("beginning training")
     for epoch in range(args.training_epochs):
         train_loss = train_one_epoch(
             model=model,
