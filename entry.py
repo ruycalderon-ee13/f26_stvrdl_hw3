@@ -629,6 +629,211 @@ def sanity_test_dataset(dataset):
             assert target["masks"].shape[0] == target["labels"].shape[0]
             assert target["masks"].shape[0] == target["boxes"].shape[0]
 
+def compute_mask_iou_matrix(pred_masks, gt_masks):
+    """
+    pred_masks: Bool tensor [P, H, W]
+    gt_masks:   Bool tensor [G, H, W]
+
+    Returns:
+        IoU tensor [P, G]
+    """
+    if pred_masks.shape[0] == 0 or gt_masks.shape[0] == 0:
+        return torch.zeros(
+            (pred_masks.shape[0], gt_masks.shape[0]),
+            dtype=torch.float32,
+        )
+
+    pred_flat = pred_masks.flatten(1).to(torch.bool)
+    gt_flat = gt_masks.flatten(1).to(torch.bool)
+
+    intersection = (pred_flat[:, None, :] & gt_flat[None, :, :]).sum(dim=2)
+    union = (pred_flat[:, None, :] | gt_flat[None, :, :]).sum(dim=2)
+
+    return intersection.float() / union.clamp(min=1).float()
+
+
+def compute_ap_from_pr(recalls, precisions):
+    """
+    COCO-style 101-point interpolated AP for one IoU threshold.
+    """
+    if len(recalls) == 0:
+        return 0.0
+
+    recall_levels = torch.linspace(0.0, 1.0, 101)
+    ap = 0.0
+
+    for recall_level in recall_levels:
+        valid = recalls >= recall_level
+
+        if valid.any():
+            ap += precisions[valid].max().item()
+        else:
+            ap += 0.0
+
+    return ap / 101.0
+
+
+@torch.no_grad()
+def evaluate_ap50(
+    model,
+    data_loader,
+    device,
+    num_classes=5,
+    mask_threshold=0.5,
+    score_threshold=0.05,
+    max_detections_per_image=300,
+):
+    """
+    Lightweight validation AP50 for instance segmentation.
+
+    This computes mask AP at IoU >= 0.50, class-aware.
+    It is meant as a quick validation signal, not a perfect replacement
+    for official COCOEval.
+    """
+    model.eval()
+
+    detections_by_class = {
+        class_id: [] for class_id in range(1, num_classes)
+    }
+    gt_by_class = {
+        class_id: {} for class_id in range(1, num_classes)
+    }
+    total_gt_by_class = {
+        class_id: 0 for class_id in range(1, num_classes)
+    }
+
+    image_uid = 0
+
+    for images, targets in data_loader:
+        images = [image.to(device) for image in images]
+
+        outputs = model(images)
+
+        for batch_idx, output in enumerate(outputs):
+            target = targets[batch_idx]
+
+            gt_labels = target["labels"].cpu()
+            gt_masks = target["masks"].cpu().to(torch.bool)
+
+            pred_scores = output["scores"].detach().cpu()
+            pred_labels = output["labels"].detach().cpu()
+
+            # output["masks"] is usually [N, 1, H, W], soft masks in [0, 1]
+            pred_masks = (
+                output["masks"]
+                .detach()
+                .cpu()[:, 0]
+                >= mask_threshold
+            )
+
+            # Apply score filtering and top-k cap to keep eval cheap.
+            keep = pred_scores >= score_threshold
+
+            pred_scores = pred_scores[keep]
+            pred_labels = pred_labels[keep]
+            pred_masks = pred_masks[keep]
+
+            if pred_scores.numel() > max_detections_per_image:
+                order = torch.argsort(pred_scores, descending=True)
+                order = order[:max_detections_per_image]
+
+                pred_scores = pred_scores[order]
+                pred_labels = pred_labels[order]
+                pred_masks = pred_masks[order]
+
+            for class_id in range(1, num_classes):
+                gt_class_keep = gt_labels == class_id
+                gt_class_masks = gt_masks[gt_class_keep]
+
+                gt_by_class[class_id][image_uid] = {
+                    "masks": gt_class_masks,
+                    "matched": torch.zeros(
+                        (gt_class_masks.shape[0],),
+                        dtype=torch.bool,
+                    ),
+                }
+
+                total_gt_by_class[class_id] += gt_class_masks.shape[0]
+
+                pred_class_keep = pred_labels == class_id
+                pred_class_scores = pred_scores[pred_class_keep]
+                pred_class_masks = pred_masks[pred_class_keep]
+
+                for pred_idx in range(pred_class_scores.shape[0]):
+                    detections_by_class[class_id].append(
+                        {
+                            "image_uid": image_uid,
+                            "score": float(pred_class_scores[pred_idx]),
+                            "mask": pred_class_masks[pred_idx],
+                        }
+                    )
+
+            image_uid += 1
+
+    ap_by_class = {}
+
+    for class_id in range(1, num_classes):
+        detections = detections_by_class[class_id]
+        num_gt = total_gt_by_class[class_id]
+
+        if num_gt == 0:
+            ap_by_class[class_id] = float("nan")
+            continue
+
+        detections = sorted(
+            detections,
+            key=lambda det: det["score"],
+            reverse=True,
+        )
+
+        tp = torch.zeros((len(detections),), dtype=torch.float32)
+        fp = torch.zeros((len(detections),), dtype=torch.float32)
+
+        for det_idx, det in enumerate(detections):
+            image_uid = det["image_uid"]
+            pred_mask = det["mask"][None, :, :]
+
+            gt_entry = gt_by_class[class_id][image_uid]
+            gt_masks = gt_entry["masks"]
+            matched = gt_entry["matched"]
+
+            if gt_masks.shape[0] == 0:
+                fp[det_idx] = 1.0
+                continue
+
+            ious = compute_mask_iou_matrix(pred_mask, gt_masks)[0]
+
+            best_iou, best_gt_idx = ious.max(dim=0)
+
+            if best_iou >= 0.50 and not matched[best_gt_idx]:
+                tp[det_idx] = 1.0
+                matched[best_gt_idx] = True
+            else:
+                fp[det_idx] = 1.0
+
+        cum_tp = torch.cumsum(tp, dim=0)
+        cum_fp = torch.cumsum(fp, dim=0)
+
+        recalls = cum_tp / max(num_gt, 1)
+        precisions = cum_tp / torch.clamp(cum_tp + cum_fp, min=1e-8)
+
+        ap_by_class[class_id] = compute_ap_from_pr(recalls, precisions)
+
+    valid_aps = [
+        ap for ap in ap_by_class.values()
+        if not math.isnan(ap)
+    ]
+
+    mean_ap50 = sum(valid_aps) / len(valid_aps) if len(valid_aps) > 0 else 0.0
+
+    print("Validation AP50:")
+    for class_id, ap in ap_by_class.items():
+        print(f"\tclass{class_id}: {ap:.4f}")
+
+    print(f"\tmAP50: {mean_ap50:.4f}")
+
+    return mean_ap50, ap_by_class
+
 if __name__=='__main__':
     args = parse_cmd()
 
@@ -693,3 +898,15 @@ if __name__=='__main__':
         )
 
         print(f"epoch={epoch}, train_loss={train_loss:.4f}")
+
+        val_ap50, val_ap50_by_class = evaluate_ap50(
+            model=model,
+            data_loader=val_loader,
+            device=device,
+            num_classes=5,
+            mask_threshold=0.5,
+            score_threshold=0.05,
+            max_detections_per_image=300,
+        )
+
+        print(f"epoch={epoch}, val_mAP50={val_ap50:.4f}")
