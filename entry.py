@@ -78,6 +78,20 @@ def parse_cmd():
         help="Specify the ratio of validation/training images"
     )
 
+    parser.add_argument(
+        "--training_epochs",
+        default=1,
+        type=int,
+        help="number of training epochs, default to 1"
+    )
+
+    parser.add_argument(
+        "--crop_size",
+        default=512,
+        type=int,
+        help="image crop size (memory constraint)"
+    )
+
     return parser.parse_args()
 
 
@@ -587,6 +601,34 @@ def get_balanced_dataset_split(dataset_path, split_percent = 0.2):
 
     return items_B
 
+def sanity_test_dataset(dataset):
+
+    for i in range(20):
+        image, target = dataset[i]
+
+        print(
+            i,
+            image.shape,
+            target["masks"].shape,
+            target["boxes"].shape,
+            target["labels"].shape,
+            target["sample_id"],
+            target["crop_box"].tolist(),
+        )
+
+        assert image.dtype == torch.float32
+        assert image.ndim == 3
+        assert target["boxes"].dtype == torch.float32
+        assert target["labels"].dtype == torch.int64
+        assert target["masks"].dtype == torch.uint8
+
+        if target["boxes"].shape[0] > 0:
+            boxes = target["boxes"]
+            assert torch.all(boxes[:, 2] > boxes[:, 0])
+            assert torch.all(boxes[:, 3] > boxes[:, 1])
+            assert target["masks"].shape[0] == target["labels"].shape[0]
+            assert target["masks"].shape[0] == target["boxes"].shape[0]
+
 if __name__=='__main__':
     args = parse_cmd()
 
@@ -596,10 +638,12 @@ if __name__=='__main__':
         print("No data path specified, exiting")
         quit()
     data_path = Path("/".join([args.data_path, 'train']))
+    print(f"training with {args.training_epochs} epochs")
+    print(f"training with crop size of {args.crop_size}^2 px ")
 
     training_dataset = ImageDataset(
         str(data_path),
-        crop_size=512,
+        crop_size=args.crop_size,
         random_crop=True,
         crop_trials=10,
         min_instances_in_crop=1,
@@ -635,7 +679,9 @@ if __name__=='__main__':
         collate_fn=collate_fn,
     )
 
-    for epoch in range(1):
+    quit()
+
+    for epoch in range(args.training_epochs):
         train_loss = train_one_epoch(
             model=model,
             data_loader=train_loader,
