@@ -7,6 +7,7 @@ from torchvision.transforms import v2 as T
 from torchvision.transforms.v2 import functional as tfunc2
 from torchvision.transforms import InterpolationMode
 from torchvision.datasets import CocoDetection, wrap_dataset_for_transforms_v2
+
 from torchvision.ops import masks_to_boxes
 from torch.utils.data import Dataset, DataLoader
 from scipy.optimize import linear_sum_assignment
@@ -14,7 +15,7 @@ from scipy.optimize import linear_sum_assignment
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from torchvision.models import resnet50
+from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
 from torchvision.models import ResNet50_Weights
 
 from torchvision.io import read_image
@@ -30,6 +31,7 @@ import random
 import time
 import os
 import math
+from collections import Counter
 
 from utils import encode_mask as rle_encode
 from utils import decode_maskobj as rle_decode_maskobj
@@ -71,7 +73,7 @@ def parse_cmd():
 
     parser.add_argument(
         "--validation_ratio",
-        default=None,
+        default=0.2,
         type=float,
         help="Specify the ratio of validation/training images"
     )
@@ -83,10 +85,10 @@ class ImageDataset(Dataset):
     def __init__(self, root_dir=None, transforms=None):
         self.root_dir = root_dir
         self.transforms = transforms
-
-        self.sample_paths = sorted(
-            [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
-        )
+        if root_dir != None:
+            self.sample_paths = sorted(
+                [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
+            )
 
         # 0 is background for torchvision detection models
         self.class_to_label = {"class1": 1,"class2": 2,"class3": 3,"class4": 4}
@@ -109,7 +111,11 @@ class ImageDataset(Dataset):
             if self.transforms is not None:
                 image = self.transforms(img)
             else:
-                image = tfunc2.to_tensor(img)
+                image = tfunc2.to_dtype(
+                    tfunc2.to_image(img),
+                    dtype=torch.float32,
+                    scale=True
+                )
 
         all_masks = []
         all_labels = []
@@ -172,76 +178,150 @@ class ImageDataset(Dataset):
         
         return other
 
-def collate_infer(batch):
-    images, targets = zip(*batch)
-    return list(images), list(targets)
+import torch
+
+
+def move_target_to_device(target, device):
+    moved = {}
+
+    for key, value in target.items():
+        if torch.is_tensor(value):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+
+    return moved
+
+
+def train_one_epoch(model, data_loader, optimizer, device, epoch):
+    model.train()
+
+    running_loss = 0.0
+
+    for step, (images, targets) in enumerate(data_loader):
+        images = [image.to(device) for image in images]
+        targets = [move_target_to_device(target, device) for target in targets]
+
+        loss_dict = model(images, targets)
+        loss = sum(loss_value for loss_value in loss_dict.values())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+        if step % 10 == 0:
+            loss_items = {
+                key: float(value.detach().cpu())
+                for key, value in loss_dict.items()
+            }
+
+            print(
+                f"epoch={epoch}, step={step}, "
+                f"loss={loss.item():.4f}, losses={loss_items}"
+            )
+
+    return running_loss / len(data_loader)
 
 
 def get_dataset_statistics(dataset):
-    print(len(dataset))
+    print(f"Gathering dataset statistics for dataset of size {len(dataset)}")
+
+    # Dataset uses:
+    # 0 = background
+    # 1 = class1
+    # 2 = class2
+    # 3 = class3
+    # 4 = class4
+    label_to_class = dataset.label_to_class
+    class_names = label_to_class[1:]  # ignore "bg"
+
+    class_basis_map = {
+        class_name: i for i, class_name in enumerate(class_names)
+    }
+
     max_width = 0
     max_height = 0
     max_instances = 0
-    min_width = 10000
-    min_height = 10000
-    min_instances = 10000
+
+    min_width = float("inf")
+    min_height = float("inf")
+    min_instances = float("inf")
+
     mean_width = 0
     mean_height = 0
     mean_instances = 0
-    instance_counts = {'class1':0, 'class2':0, 'class3': 0, 'class4': 0}
-    image_counts = {'class1':0, 'class2':0, 'class3': 0, 'class4': 0}
-    class_basis_map = {'class1':0, 'class2':1, 'class3': 2, 'class4': 3}
+
+    instance_counts = {class_name: 0 for class_name in class_names}
+    image_counts = {class_name: 0 for class_name in class_names}
+
     image_vectors = {}
 
     for image, target in dataset:
-        width, height = target['orig_size']
-        instances = 0
-        image_vectors[target['sample_id']] = [0,0,0,0]
-        if target
-        for mask in target['masks']:
-            mask_instances = len(mask['instance_arr'])
-            image_vectors[target['sample_id']][class_basis_map[mask['class_id']]] = 1
-            instance_counts[mask['class_id']] += mask_instances
-            instances += mask_instances
-            image_counts[mask['class_id']] += 1
+        sample_id = target["sample_id"]
 
-        if width > max_width:
-            max_width = width
-        if height > max_height:
-            max_height = height
-        if instances > max_instances:
-            max_instances = instances
+        height, width = target["orig_size"].tolist()
 
-        if width < min_width:
-            min_width = width
-        if height < min_height:
-            min_height = height
-        if instances < min_instances:
-            min_instances = instances
+        labels = target["labels"]  # shape [N]
+        instances = len(labels)
+
+        image_vectors[sample_id] = [0 for _ in class_names]
+
+        label_counts = Counter(labels.tolist())
+
+        for label, count in label_counts.items():
+            if label == 0:
+                continue
+
+            class_name = label_to_class[label]
+
+            instance_counts[class_name] += count
+            image_counts[class_name] += 1
+
+            image_vectors[sample_id][class_basis_map[class_name]] = 1
+
+        max_width = max(max_width, width)
+        max_height = max(max_height, height)
+        max_instances = max(max_instances, instances)
+
+        min_width = min(min_width, width)
+        min_height = min(min_height, height)
+        min_instances = min(min_instances, instances)
 
         mean_width += width
         mean_height += height
         mean_instances += instances
 
-    mean_width /= len(dataset)
-    mean_height /= len(dataset)
-    mean_instances /= len(dataset)
+    dataset_len = len(dataset)
+
+    if dataset_len > 0:
+        mean_width /= dataset_len
+        mean_height /= dataset_len
+        mean_instances /= dataset_len
+    else:
+        min_width = 0
+        min_height = 0
+        min_instances = 0
 
     print("Dataset Statistics:")
-    print(f"\tmax_width: {str(max_width)}") 
-    print(f"\tmax_height: {str(max_height)}") 
-    print(f"\tmax_instances: {str(max_instances)}") 
-    print(f"\tmin_width: {str(min_width)}") 
-    print(f"\tmin_height: {str(min_height)}") 
-    print(f"\tmin_instances: {str(min_instances)}") 
-    print(f"\tmean_width: {str(mean_width)}") 
-    print(f"\tmean_height: {str(mean_height)}") 
-    print(f"\tmean_instances: {str(mean_instances)}")
-    print("\tClass Statistics: ")
+    print(f"\tmax_width: {max_width}") 
+    print(f"\tmax_height: {max_height}") 
+    print(f"\tmax_instances: {max_instances}") 
+    print(f"\tmin_width: {min_width}") 
+    print(f"\tmin_height: {min_height}") 
+    print(f"\tmin_instances: {min_instances}") 
+    print(f"\tmean_width: {mean_width}")
+    print(f"\tmean_height: {mean_height}")
+    print(f"\tmean_instances: {mean_instances}")
+
+    print("\tClass Statistics:")
+    print("\tInstance counts:")
     print(instance_counts)
+    print("\tImage counts:")
     print(image_counts)
 
-    return [(k,v) for k,v in image_vectors.items()]
+    return [(k, v) for k, v in image_vectors.items()]
 
 def sum_dataset(dataset):
     sums = [0,0,0,0]
@@ -254,13 +334,32 @@ def get_progress(current, target):
     return [current[i] / target[i] for i in range(4)]
 
 
+def get_instance_segmenter(num_classes=5):
+    model = maskrcnn_resnet50_fpn_v2(
+        weights=None, #coco pretrained weights not allowed, so will keep this as None
+        weights_backbone=ResNet50_Weights.DEFAULT,
+        num_classes=num_classes,
+        trainable_backbone_layers=3,
+
+        box_detections_per_img=1000,
+
+        rpn_post_nms_top_n_train=2000,
+        rpn_post_nms_top_n_test=1000,
+    )
+
+    return model
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
 
 if __name__=='__main__':
     args = parse_cmd()
 
     device, device_string = init_device()
     print(f"Using {device_string} backend ")
-
+    if args.data_path == None:
+        print("No data path specified, exiting")
+        quit()
     data_path = Path("/".join([args.data_path, 'train']))
     
     training_dataset = ImageDataset(str(data_path))
@@ -274,48 +373,85 @@ if __name__=='__main__':
     
     
     image_vectors = get_dataset_statistics(training_dataset)
-    # sums = sum_dataset(image_vectors)
-    # even_split_goal = []
-    # for i in range(4):
-    #     even_split_goal.append(sums[i] * args.validation_ratio)
+    sums = sum_dataset(image_vectors)
+    even_split_goal = []
+    for i in range(4):
+        even_split_goal.append(sums[i] * args.validation_ratio)
     
-    # val_image_count = len(training_dataset) * args.validation_ratio
-    # print(f"Want { \
-    #     math.ceil(val_image_count)} validation images having [class1,class2,class3,class4] totals exceeding {[math.floor(t) for t in even_split_goal]}")
+    val_image_count = len(training_dataset) * args.validation_ratio
+    print(f"Want { \
+        math.ceil(val_image_count)} validation images having [class1,class2,class3,class4] totals exceeding {[math.floor(t) for t in even_split_goal]}")
 
-    # training_items = image_vectors
-    # validation_items = []
-    # for i in range(10):
-    #     next_choice = training_items.pop(random.randint(0,len(training_items)))
-    #     validation_items.append(next_choice)
-    #     for x in range(4):
-    #         sums[x] -= next_choice[1][x]
+    training_items = image_vectors
+    print(len(training_items))
+    validation_items = []
+    for i in range(10):
+        next_choice = training_items.pop(random.randint(0,len(training_items)-1))
+        validation_items.append(next_choice)
+        for x in range(4):
+            sums[x] -= next_choice[1][x]
     
-    # valid_sum = sum_dataset(validation_items)
+    valid_sum = sum_dataset(validation_items)
     
-    # progress = get_progress(valid_sum, even_split_goal)
-    # remaining = val_image_count - 10
-    # while min(progress) < 1.0 or remaining > 0:
-    #     direction = progress.index(min(progress))
+    progress = get_progress(valid_sum, even_split_goal)
+    remaining = val_image_count - 10
+    while min(progress) < 1.0 or remaining > 0:
+        direction = progress.index(min(progress))
         
-    #     training_items = sorted(training_items, key=lambda x: x[1][direction], reverse=True)
-    #     next_choice = training_items.pop(random.randint(0,sums[direction]))
-    #     validation_items.append(next_choice)
-    #     for x in range(4):
-    #         sums[x] -= next_choice[1][x]
-    #         valid_sum[x] += next_choice[1][x]
-    #     remaining -= 1
-    #     progress = get_progress(valid_sum, even_split_goal)
+        training_items = sorted(training_items, key=lambda x: x[1][direction], reverse=True)
+        next_choice = training_items.pop(random.randint(0,sums[direction]-1))
+        validation_items.append(next_choice)
+        for x in range(4):
+            sums[x] -= next_choice[1][x]
+            valid_sum[x] += next_choice[1][x]
+        remaining -= 1
+        progress = get_progress(valid_sum, even_split_goal)
 
-    # print("Random Dataset Split Totals:")
-    # print(f"\tvalidation dataset {len(validation_items)} items, class totals: {sum_dataset(validation_items)}")
-    # print(f"\ttraining dataset {len(training_items)} items, class totals: {sum_dataset(training_items)}")
-    
-    # validation_dataset = training_dataset.split(validation_items)
+    print("Random Dataset Split Totals:")
+    print(f"\tvalidation dataset {len(validation_items)} items, class totals: {sum_dataset(validation_items)}")
+    print(f"\ttraining dataset {len(training_items)} items, class totals: {sum_dataset(training_items)}")
+    validation_dataset = training_dataset.split(validation_items)
 
     # print("Validation Dataset Statistics")
     # get_dataset_statistics(validation_dataset)
     # print("Training Dataset Statistics")
     # get_dataset_statistics(training_dataset)
 
-    # print(len(training_dataset) + len(validation_dataset))
+    #print(len(training_dataset) + len(validation_dataset))
+
+
+    model = get_instance_segmenter(5)
+    model.to(device)
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=1e-4,
+        weight_decay=1e-4,
+    )
+
+    train_loader = DataLoader(
+        training_dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_fn,
+    )
+
+    val_loader = DataLoader(
+        validation_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn,
+    )
+
+    for epoch in range(1):
+        train_loss = train_one_epoch(
+            model=model,
+            data_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+        )
+
+        print(f"epoch={epoch}, train_loss={train_loss:.4f}")
