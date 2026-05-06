@@ -12,8 +12,11 @@ from torchvision.ops import masks_to_boxes
 from torch.utils.data import Dataset, DataLoader
 from scipy.optimize import linear_sum_assignment
 
+
+import numpy as np
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+from pycocotools import mask as mask_utils
 
 from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
 from torchvision.models import ResNet50_Weights
@@ -499,17 +502,21 @@ def get_progress(current, target):
     return [current[i] / target[i] for i in range(4)]
 
 
-def get_instance_segmenter(num_classes=5):
+def get_instance_segmenter(num_classes=5, image_size=512):
     model = maskrcnn_resnet50_fpn_v2(
         weights=None, #coco pretrained weights not allowed, so will keep this as None
         weights_backbone=ResNet50_Weights.DEFAULT,
         num_classes=num_classes,
         trainable_backbone_layers=3,
-
-        box_detections_per_img=1000,
-
-        rpn_post_nms_top_n_train=2000,
-        rpn_post_nms_top_n_test=1000,
+        min_size=1,
+        max_size=image_size,
+        
+        box_detections_per_img=300,
+        
+        rpn_pre_nms_top_n_train=1000,
+        rpn_post_nms_top_n_train=300,
+        rpn_pre_nms_top_n_test=1000,
+        rpn_post_nms_top_n_test=300,
     )
 
     return model
@@ -629,52 +636,96 @@ def sanity_test_dataset(dataset):
             assert target["masks"].shape[0] == target["labels"].shape[0]
             assert target["masks"].shape[0] == target["boxes"].shape[0]
 
-def compute_mask_iou_matrix(pred_masks, gt_masks):
-    """
-    pred_masks: Bool tensor [P, H, W]
-    gt_masks:   Bool tensor [G, H, W]
 
-    Returns:
-        IoU tensor [P, G]
+def binary_mask_to_coco_rle(mask):
     """
-    if pred_masks.shape[0] == 0 or gt_masks.shape[0] == 0:
-        return torch.zeros(
-            (pred_masks.shape[0], gt_masks.shape[0]),
-            dtype=torch.float32,
+    mask: torch.Tensor or np.ndarray [H, W], bool/uint8
+    returns COCO compressed RLE
+    """
+    if torch.is_tensor(mask):
+        mask = mask.detach().cpu().numpy()
+
+    mask = mask.astype(np.uint8)
+    mask = np.asfortranarray(mask)
+
+    rle = mask_utils.encode(mask)
+
+    # pycocotools returns bytes; JSON-style COCO results need string counts.
+    rle["counts"] = rle["counts"].decode("utf-8")
+
+    return rle
+
+
+def build_coco_gt_from_targets(all_targets, num_classes=5):
+    """
+    Build a COCO ground-truth object from torchvision-style targets.
+
+    all_targets: list of target dicts, one per validation image/crop.
+    """
+    coco_gt_dict = {
+        "info": {},
+        "licenses": [],
+        "images": [],
+        "annotations": [],
+        "categories": [
+            {"id": class_id, "name": f"class{class_id}"}
+            for class_id in range(1, num_classes)
+        ],
+    }
+
+    ann_id = 1
+
+    for image_id, target in enumerate(all_targets):
+        masks = target["masks"].cpu()
+        labels = target["labels"].cpu()
+        boxes = target["boxes"].cpu()
+        areas = target["area"].cpu()
+
+        height, width = target["orig_size"].tolist()
+
+        coco_gt_dict["images"].append(
+            {
+                "id": image_id,
+                "width": int(width),
+                "height": int(height),
+                "file_name": str(target["sample_id"]),
+            }
         )
 
-    pred_flat = pred_masks.flatten(1).to(torch.bool)
-    gt_flat = gt_masks.flatten(1).to(torch.bool)
+        for obj_idx in range(masks.shape[0]):
+            mask = masks[obj_idx].to(torch.bool)
+            rle = binary_mask_to_coco_rle(mask)
 
-    intersection = (pred_flat[:, None, :] & gt_flat[None, :, :]).sum(dim=2)
-    union = (pred_flat[:, None, :] | gt_flat[None, :, :]).sum(dim=2)
+            x1, y1, x2, y2 = boxes[obj_idx].tolist()
+            bbox = [
+                float(x1),
+                float(y1),
+                float(x2 - x1),
+                float(y2 - y1),
+            ]
 
-    return intersection.float() / union.clamp(min=1).float()
+            coco_gt_dict["annotations"].append(
+                {
+                    "id": ann_id,
+                    "image_id": image_id,
+                    "category_id": int(labels[obj_idx]),
+                    "segmentation": rle,
+                    "bbox": bbox,
+                    "area": float(areas[obj_idx]),
+                    "iscrowd": 0,
+                }
+            )
 
+            ann_id += 1
 
-def compute_ap_from_pr(recalls, precisions):
-    """
-    COCO-style 101-point interpolated AP for one IoU threshold.
-    """
-    if len(recalls) == 0:
-        return 0.0
+    coco_gt = COCO()
+    coco_gt.dataset = coco_gt_dict
+    coco_gt.createIndex()
 
-    recall_levels = torch.linspace(0.0, 1.0, 101)
-    ap = 0.0
+    return coco_gt
 
-    for recall_level in recall_levels:
-        valid = recalls >= recall_level
-
-        if valid.any():
-            ap += precisions[valid].max().item()
-        else:
-            ap += 0.0
-
-    return ap / 101.0
-
-
-@torch.no_grad()
-def evaluate_ap50(
+@torch.inference_mode()
+def evaluate_coco_ap50(
     model,
     data_loader,
     device,
@@ -684,155 +735,101 @@ def evaluate_ap50(
     max_detections_per_image=300,
 ):
     """
-    Lightweight validation AP50 for instance segmentation.
+    Official pycocotools COCOeval for instance segmentation AP50.
 
-    This computes mask AP at IoU >= 0.50, class-aware.
-    It is meant as a quick validation signal, not a perfect replacement
-    for official COCOEval.
+    Model inference runs on GPU.
+    COCO RLE encoding + COCOeval run on CPU.
     """
     model.eval()
 
-    detections_by_class = {
-        class_id: [] for class_id in range(1, num_classes)
-    }
-    gt_by_class = {
-        class_id: {} for class_id in range(1, num_classes)
-    }
-    total_gt_by_class = {
-        class_id: 0 for class_id in range(1, num_classes)
-    }
+    all_targets = []
+    coco_results = []
 
-    image_uid = 0
+    image_id = 0
 
     for images, targets in data_loader:
         images = [image.to(device) for image in images]
-
         outputs = model(images)
 
-        for batch_idx, output in enumerate(outputs):
-            target = targets[batch_idx]
+        for output, target in zip(outputs, targets):
+            # Store GT target for COCO GT construction.
+            all_targets.append(target)
 
-            gt_labels = target["labels"].cpu()
-            gt_masks = target["masks"].cpu().to(torch.bool)
+            scores = output["scores"].detach().cpu()
+            labels = output["labels"].detach().cpu()
+            boxes = output["boxes"].detach().cpu()
+            masks = output["masks"].detach().cpu()[:, 0] >= mask_threshold
 
-            pred_scores = output["scores"].detach().cpu()
-            pred_labels = output["labels"].detach().cpu()
+            keep = scores >= score_threshold
 
-            # output["masks"] is usually [N, 1, H, W], soft masks in [0, 1]
-            pred_masks = (
-                output["masks"]
-                .detach()
-                .cpu()[:, 0]
-                >= mask_threshold
-            )
+            scores = scores[keep]
+            labels = labels[keep]
+            boxes = boxes[keep]
+            masks = masks[keep]
 
-            # Apply score filtering and top-k cap to keep eval cheap.
-            keep = pred_scores >= score_threshold
-
-            pred_scores = pred_scores[keep]
-            pred_labels = pred_labels[keep]
-            pred_masks = pred_masks[keep]
-
-            if pred_scores.numel() > max_detections_per_image:
-                order = torch.argsort(pred_scores, descending=True)
+            if scores.numel() > max_detections_per_image:
+                order = torch.argsort(scores, descending=True)
                 order = order[:max_detections_per_image]
 
-                pred_scores = pred_scores[order]
-                pred_labels = pred_labels[order]
-                pred_masks = pred_masks[order]
+                scores = scores[order]
+                labels = labels[order]
+                boxes = boxes[order]
+                masks = masks[order]
 
-            for class_id in range(1, num_classes):
-                gt_class_keep = gt_labels == class_id
-                gt_class_masks = gt_masks[gt_class_keep]
+            for pred_idx in range(scores.shape[0]):
+                mask = masks[pred_idx]
+                rle = binary_mask_to_coco_rle(mask)
 
-                gt_by_class[class_id][image_uid] = {
-                    "masks": gt_class_masks,
-                    "matched": torch.zeros(
-                        (gt_class_masks.shape[0],),
-                        dtype=torch.bool,
-                    ),
-                }
+                x1, y1, x2, y2 = boxes[pred_idx].tolist()
+                bbox = [
+                    float(x1),
+                    float(y1),
+                    float(x2 - x1),
+                    float(y2 - y1),
+                ]
 
-                total_gt_by_class[class_id] += gt_class_masks.shape[0]
+                coco_results.append(
+                    {
+                        "image_id": image_id,
+                        "category_id": int(labels[pred_idx]),
+                        "segmentation": rle,
+                        "bbox": bbox,
+                        "score": float(scores[pred_idx]),
+                    }
+                )
 
-                pred_class_keep = pred_labels == class_id
-                pred_class_scores = pred_scores[pred_class_keep]
-                pred_class_masks = pred_masks[pred_class_keep]
+            image_id += 1
 
-                for pred_idx in range(pred_class_scores.shape[0]):
-                    detections_by_class[class_id].append(
-                        {
-                            "image_uid": image_uid,
-                            "score": float(pred_class_scores[pred_idx]),
-                            "mask": pred_class_masks[pred_idx],
-                        }
-                    )
+    coco_gt = build_coco_gt_from_targets(
+        all_targets,
+        num_classes=num_classes,
+    )
 
-            image_uid += 1
+    if len(coco_results) == 0:
+        print("No predictions survived score threshold.")
+        return 0.0, None
 
-    ap_by_class = {}
+    coco_dt = coco_gt.loadRes(coco_results)
 
-    for class_id in range(1, num_classes):
-        detections = detections_by_class[class_id]
-        num_gt = total_gt_by_class[class_id]
+    coco_eval = COCOeval(coco_gt, coco_dt, iouType="segm")
 
-        if num_gt == 0:
-            ap_by_class[class_id] = float("nan")
-            continue
+    # AP50 only.
+    coco_eval.params.iouThrs = np.array([0.50])
 
-        detections = sorted(
-            detections,
-            key=lambda det: det["score"],
-            reverse=True,
-        )
+    # Important for crowded cell images.
+    coco_eval.params.maxDets = [1, 10, max_detections_per_image]
 
-        tp = torch.zeros((len(detections),), dtype=torch.float32)
-        fp = torch.zeros((len(detections),), dtype=torch.float32)
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
 
-        for det_idx, det in enumerate(detections):
-            image_uid = det["image_uid"]
-            pred_mask = det["mask"][None, :, :]
+    # With iouThrs=[0.50], stats[0] is AP averaged over the available IoU
+    # thresholds, meaning AP50 here.
+    ap50 = float(coco_eval.stats[0])
 
-            gt_entry = gt_by_class[class_id][image_uid]
-            gt_masks = gt_entry["masks"]
-            matched = gt_entry["matched"]
+    print(f"Official COCOeval segm AP50: {ap50:.4f}")
 
-            if gt_masks.shape[0] == 0:
-                fp[det_idx] = 1.0
-                continue
-
-            ious = compute_mask_iou_matrix(pred_mask, gt_masks)[0]
-
-            best_iou, best_gt_idx = ious.max(dim=0)
-
-            if best_iou >= 0.50 and not matched[best_gt_idx]:
-                tp[det_idx] = 1.0
-                matched[best_gt_idx] = True
-            else:
-                fp[det_idx] = 1.0
-
-        cum_tp = torch.cumsum(tp, dim=0)
-        cum_fp = torch.cumsum(fp, dim=0)
-
-        recalls = cum_tp / max(num_gt, 1)
-        precisions = cum_tp / torch.clamp(cum_tp + cum_fp, min=1e-8)
-
-        ap_by_class[class_id] = compute_ap_from_pr(recalls, precisions)
-
-    valid_aps = [
-        ap for ap in ap_by_class.values()
-        if not math.isnan(ap)
-    ]
-
-    mean_ap50 = sum(valid_aps) / len(valid_aps) if len(valid_aps) > 0 else 0.0
-
-    print("Validation AP50:")
-    for class_id, ap in ap_by_class.items():
-        print(f"\tclass{class_id}: {ap:.4f}")
-
-    print(f"\tmAP50: {mean_ap50:.4f}")
-
-    return mean_ap50, ap_by_class
+    return ap50, coco_eval
 
 if __name__=='__main__':
     args = parse_cmd()
@@ -860,7 +857,7 @@ if __name__=='__main__':
     validation_dataset.min_instances_in_crop = 0
 
     print("creating model")
-    model = get_instance_segmenter(5)
+    model = get_instance_segmenter(5, 512)
     model.to(device)
 
     print("creating optimizer")
@@ -899,7 +896,7 @@ if __name__=='__main__':
 
         print(f"epoch={epoch}, train_loss={train_loss:.4f}")
 
-        val_ap50, val_ap50_by_class = evaluate_ap50(
+        val_ap50, coco_eval = evaluate_coco_ap50(
             model=model,
             data_loader=val_loader,
             device=device,
@@ -909,4 +906,4 @@ if __name__=='__main__':
             max_detections_per_image=300,
         )
 
-        print(f"epoch={epoch}, val_mAP50={val_ap50:.4f}")
+        print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
