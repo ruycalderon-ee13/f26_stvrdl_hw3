@@ -82,33 +82,151 @@ def parse_cmd():
 
 
 class ImageDataset(Dataset):
-    def __init__(self, root_dir=None, transforms=None):
+    def __init__(
+        self,
+        root_dir=None,
+        transforms=None,
+        crop_size=512,
+        random_crop=True,
+        crop_trials=10,
+        min_instances_in_crop=1,
+    ):
         self.root_dir = root_dir
         self.transforms = transforms
-        if root_dir != None:
+
+        self.crop_size = crop_size
+        self.random_crop = random_crop
+        self.crop_trials = crop_trials
+        self.min_instances_in_crop = min_instances_in_crop
+
+        if root_dir is not None:
             self.sample_paths = sorted(
-                [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
+                [
+                    f for f in os.listdir(root_dir)
+                    if os.path.isdir(os.path.join(root_dir, f))
+                ]
             )
+        else:
+            self.sample_paths = []
 
         # 0 is background for torchvision detection models
-        self.class_to_label = {"class1": 1,"class2": 2,"class3": 3,"class4": 4}
-        self.label_to_class = ["bg","class1","class2","class3","class4"]
+        self.class_to_label = {
+            "class1": 1,
+            "class2": 2,
+            "class3": 3,
+            "class4": 4,
+        }
+        self.label_to_class = ["bg", "class1", "class2", "class3", "class4"]
 
     def __len__(self):
         return len(self.sample_paths)
 
+    def _load_class_maps(self, class_paths):
+        """
+        Load each class mask image as an instance-ID map, e.g. pixels with value
+        1 belong to one instance, pixels with value 2 belong to another, etc.
+        """
+        class_mask_maps = {}
+
+        for class_mask_path in class_paths:
+            class_name = os.path.basename(class_mask_path).split(".")[0]
+            class_mask_maps[class_name] = rle_read_maskfile(class_mask_path)
+
+        return class_mask_maps
+
+    def _get_crop_hw(self, orig_h, orig_w):
+        crop_h = min(self.crop_size, orig_h)
+        crop_w = min(self.crop_size, orig_w)
+        return crop_h, crop_w
+
+    def _sample_crop_coords(self, orig_h, orig_w):
+        crop_h, crop_w = self._get_crop_hw(orig_h, orig_w)
+
+        if self.random_crop:
+            y0 = 0 if orig_h == crop_h else random.randint(0, orig_h - crop_h)
+            x0 = 0 if orig_w == crop_w else random.randint(0, orig_w - crop_w)
+        else:
+            y0 = (orig_h - crop_h) // 2
+            x0 = (orig_w - crop_w) // 2
+
+        y1 = y0 + crop_h
+        x1 = x0 + crop_w
+
+        return x0, y0, x1, y1
+
+    def _count_instances_in_crop(self, class_mask_maps, crop_box):
+        x0, y0, x1, y1 = crop_box
+        total_instances = 0
+
+        for class_name, mask_img in class_mask_maps.items():
+            crop_mask = mask_img[y0:y1, x0:x1]
+            instance_ids = rle_maskobj_get_instances(crop_mask)
+            total_instances += len(instance_ids)
+
+        return total_instances
+
+    def _choose_crop_box(self, orig_h, orig_w, class_mask_maps):
+        """
+        Try a few crop candidates and prefer one containing at least
+        min_instances_in_crop instances.
+        """
+        if self.crop_size is None:
+            return (0, 0, orig_w, orig_h)
+
+        best_crop = None
+        best_count = -1
+
+        for _ in range(self.crop_trials):
+            crop_box = self._sample_crop_coords(orig_h, orig_w)
+            instance_count = self._count_instances_in_crop(class_mask_maps, crop_box)
+
+            if instance_count >= self.min_instances_in_crop:
+                return crop_box
+
+            if instance_count > best_count:
+                best_count = instance_count
+                best_crop = crop_box
+
+        # fallback: return the best crop we saw, even if empty
+        return best_crop
+
     def __getitem__(self, idx):
-        sample_path = os.path.join(self.root_dir, self.sample_paths[idx])
+        sample_id = self.sample_paths[idx]
+        sample_path = os.path.join(self.root_dir, sample_id)
 
         file_paths = os.listdir(sample_path)
-        image_path = [os.path.join(sample_path, f) for f in file_paths if f.startswith("image")][0]
-        class_paths = [os.path.join(sample_path, f) for f in file_paths if f.startswith("class")]
+        image_path = [
+            os.path.join(sample_path, f)
+            for f in file_paths
+            if f.startswith("image")
+        ][0]
 
+        class_paths = [
+            os.path.join(sample_path, f)
+            for f in file_paths
+            if f.startswith("class")
+        ]
+
+        # Load image metadata first
         with Image.open(image_path) as img:
             img = img.convert("RGB")
             orig_w, orig_h = img.size
 
+            # Load full per-class instance-ID maps
+            class_mask_maps = self._load_class_maps(class_paths)
+
+            # Choose crop
+            crop_box = self._choose_crop_box(orig_h, orig_w, class_mask_maps)
+            x0, y0, x1, y1 = crop_box
+
+            # Crop image first
+            img = img.crop((x0, y0, x1, y1))
+            crop_w, crop_h = img.size
+
+            # Convert image to tensor
             if self.transforms is not None:
+                # Keep this for photometric transforms only unless you explicitly
+                # make the same geometric transform happen to masks.
                 image = self.transforms(img)
             else:
                 image = tfunc2.to_dtype(
@@ -117,35 +235,57 @@ class ImageDataset(Dataset):
                     scale=True
                 )
 
+        # Now build instance masks ONLY from the crop
         all_masks = []
         all_labels = []
 
-        for instance_mask_path in class_paths:
-            class_name = os.path.basename(instance_mask_path).split(".")[0]
+        for class_name, full_mask_img in class_mask_maps.items():
             class_label = self.class_to_label[class_name]
 
-            mask_img = rle_read_maskfile(instance_mask_path)
+            crop_mask_img = full_mask_img[y0:y1, x0:x1]
+            instance_ids = rle_maskobj_get_instances(crop_mask_img)
 
-            instance_masks = rle_maskobj_get_instances(mask_img)
+            for inst_id in instance_ids:
+                m = torch.as_tensor(crop_mask_img == inst_id, dtype=torch.uint8)
 
-            for m_idx in instance_masks:
-                m = torch.as_tensor(mask_img == m_idx, dtype=torch.uint8)
                 if m.sum() == 0:
                     continue
+
                 all_masks.append(m)
                 all_labels.append(class_label)
 
         if len(all_masks) == 0:
-            masks = torch.zeros((0, orig_h, orig_w), dtype=torch.uint8)
+            masks = torch.zeros((0, crop_h, crop_w), dtype=torch.uint8)
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.int64)
             area = torch.zeros((0,), dtype=torch.float32)
             iscrowd = torch.zeros((0,), dtype=torch.int64)
         else:
-            masks = torch.stack(all_masks, dim=0)                  # [N, H, W]
-            labels = torch.tensor(all_labels, dtype=torch.int64)   # [N]
-            boxes = masks_to_boxes(masks)          # [N, 4]
-            area = masks.flatten(1).sum(dim=1).to(torch.float32)   # [N]
+            masks = torch.stack(all_masks, dim=0)
+            labels = torch.tensor(all_labels, dtype=torch.int64)
+
+            boxes = masks_to_boxes(masks)
+            area = masks.flatten(1).sum(dim=1).to(torch.float32)
+
+            min_mask_area = 4
+
+            keep = (
+                (boxes[:, 2] > boxes[:, 0]) &
+                (boxes[:, 3] > boxes[:, 1]) &
+                (area >= min_mask_area)
+            )
+
+            masks = masks[keep]
+            labels = labels[keep]
+            boxes = boxes[keep]
+            area = area[keep]
+
+            if masks.shape[0] == 0:
+                masks = torch.zeros((0, crop_h, crop_w), dtype=torch.uint8)
+                boxes = torch.zeros((0, 4), dtype=torch.float32)
+                labels = torch.zeros((0,), dtype=torch.int64)
+                area = torch.zeros((0,), dtype=torch.float32)
+
             iscrowd = torch.zeros((masks.shape[0],), dtype=torch.int64)
 
         target = {
@@ -153,32 +293,39 @@ class ImageDataset(Dataset):
             "labels": labels,
             "masks": masks,
             "image_id": torch.tensor([idx], dtype=torch.int64),
+
+            # IMPORTANT: these should match the CURRENT tensor/image size
             "area": area,
             "iscrowd": iscrowd,
-            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
-            "sample_id": self.sample_paths[idx]
+            "orig_size": torch.tensor([crop_h, crop_w], dtype=torch.int64),
+
+            # extra metadata
+            "sample_id": sample_id,
+            "crop_box": torch.tensor([x0, y0, x1, y1], dtype=torch.int64),
+            "source_orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
         }
 
         return image, target
-    
+
     def split(self, split_items):
         other = ImageDataset()
         other.root_dir = self.root_dir
         other.transforms = self.transforms
-        
+
+        other.crop_size = self.crop_size
+        other.random_crop = self.random_crop
+        other.crop_trials = self.crop_trials
+        other.min_instances_in_crop = self.min_instances_in_crop
+
+        other.class_to_label = self.class_to_label
+        other.label_to_class = self.label_to_class
+
         other.sample_paths = [item[0] for item in split_items]
-        self.sample_paths = [f for f in self.sample_paths if f not in [name for name, data in split_items]]
 
-        for path in other.sample_paths:
-            if path in self.sample_paths:
-                print("split bug")
-        for path in self.sample_paths:
-            if path in other.sample_paths:
-                print("split bug other way")
-        
+        split_names = {name for name, data in split_items}
+        self.sample_paths = [f for f in self.sample_paths if f not in split_names]
+
         return other
-
-import torch
 
 
 def move_target_to_device(target, device):
@@ -226,20 +373,9 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch):
 
 
 def get_dataset_statistics(dataset):
-    print(f"Gathering dataset statistics for dataset of size {len(dataset)}")
+    print(f"Gathering LIGHT dataset statistics for dataset of size {len(dataset)}")
 
-    # Dataset uses:
-    # 0 = background
-    # 1 = class1
-    # 2 = class2
-    # 3 = class3
-    # 4 = class4
-    label_to_class = dataset.label_to_class
-    class_names = label_to_class[1:]  # ignore "bg"
-
-    class_basis_map = {
-        class_name: i for i, class_name in enumerate(class_names)
-    }
+    class_names = dataset.label_to_class[1:]
 
     max_width = 0
     max_height = 0
@@ -258,40 +394,55 @@ def get_dataset_statistics(dataset):
 
     image_vectors = {}
 
-    for image, target in dataset:
-        sample_id = target["sample_id"]
+    for sample_id in dataset.sample_paths:
+        sample_path = os.path.join(dataset.root_dir, sample_id)
+        file_paths = os.listdir(sample_path)
 
-        height, width = target["orig_size"].tolist()
+        image_path = [
+            os.path.join(sample_path, f)
+            for f in file_paths
+            if f.startswith("image")
+        ][0]
 
-        labels = target["labels"]  # shape [N]
-        instances = len(labels)
+        class_paths = [
+            os.path.join(sample_path, f)
+            for f in file_paths
+            if f.startswith("class")
+        ]
 
-        image_vectors[sample_id] = [0 for _ in class_names]
+        with Image.open(image_path) as img:
+            width, height = img.size
 
-        label_counts = Counter(labels.tolist())
+        image_vectors[sample_id] = [0, 0, 0, 0]
 
-        for label, count in label_counts.items():
-            if label == 0:
-                continue
+        instances_in_image = 0
 
-            class_name = label_to_class[label]
+        for class_path in class_paths:
+            class_name = os.path.basename(class_path).split(".")[0]
+            class_idx = dataset.class_to_label[class_name] - 1
 
-            instance_counts[class_name] += count
-            image_counts[class_name] += 1
+            mask_img = rle_read_maskfile(class_path)
+            instance_ids = rle_maskobj_get_instances(mask_img)
 
-            image_vectors[sample_id][class_basis_map[class_name]] = 1
+            num_instances = len(instance_ids)
+
+            if num_instances > 0:
+                image_vectors[sample_id][class_idx] = 1
+                image_counts[class_name] += 1
+                instance_counts[class_name] += num_instances
+                instances_in_image += num_instances
 
         max_width = max(max_width, width)
         max_height = max(max_height, height)
-        max_instances = max(max_instances, instances)
+        max_instances = max(max_instances, instances_in_image)
 
         min_width = min(min_width, width)
         min_height = min(min_height, height)
-        min_instances = min(min_instances, instances)
+        min_instances = min(min_instances, instances_in_image)
 
         mean_width += width
         mean_height += height
-        mean_instances += instances
+        mean_instances += instances_in_image
 
     dataset_len = len(dataset)
 
@@ -305,12 +456,12 @@ def get_dataset_statistics(dataset):
         min_instances = 0
 
     print("Dataset Statistics:")
-    print(f"\tmax_width: {max_width}") 
-    print(f"\tmax_height: {max_height}") 
-    print(f"\tmax_instances: {max_instances}") 
-    print(f"\tmin_width: {min_width}") 
-    print(f"\tmin_height: {min_height}") 
-    print(f"\tmin_instances: {min_instances}") 
+    print(f"\tmax_width: {max_width}")
+    print(f"\tmax_height: {max_height}")
+    print(f"\tmax_instances: {max_instances}")
+    print(f"\tmin_width: {min_width}")
+    print(f"\tmin_height: {min_height}")
+    print(f"\tmin_instances: {min_instances}")
     print(f"\tmean_width: {mean_width}")
     print(f"\tmean_height: {mean_height}")
     print(f"\tmean_instances: {mean_instances}")
@@ -352,6 +503,90 @@ def get_instance_segmenter(num_classes=5):
 def collate_fn(batch):
     return tuple(zip(*batch))
 
+def get_image_class_vectors(root_dir):
+    class_names = ["class1", "class2", "class3", "class4"]
+    class_basis_map = {
+        class_name: i for i, class_name in enumerate(class_names)
+    }
+
+    image_vectors = {}
+
+    sample_paths = sorted(
+        [
+            f for f in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, f))
+        ]
+    )
+
+    for sample_id in sample_paths:
+        sample_path = os.path.join(root_dir, sample_id)
+        file_paths = os.listdir(sample_path)
+
+        image_vectors[sample_id] = [0, 0, 0, 0]
+
+        class_paths = [
+            os.path.join(sample_path, f)
+            for f in file_paths
+            if f.startswith("class")
+        ]
+
+        for class_path in class_paths:
+            class_name = os.path.basename(class_path).split(".")[0]
+
+            mask_img = rle_read_maskfile(class_path)
+            instance_ids = rle_maskobj_get_instances(mask_img)
+
+            if len(instance_ids) > 0:
+                class_idx = class_basis_map[class_name]
+                image_vectors[sample_id][class_idx] = 1
+
+    return [(sample_id, vector) for sample_id, vector in image_vectors.items()]
+
+def get_balanced_dataset_split(dataset_path, split_percent = 0.2):
+    image_vectors = get_image_class_vectors(str(dataset_path))
+    sums = sum_dataset(image_vectors)
+    even_split_goal = []
+    for i in range(4):
+        even_split_goal.append(sums[i] * split_percent)
+    
+    split_image_count = len(training_dataset) * split_percent
+    target_counts = [math.floor(t) for t in even_split_goal]
+    print(
+        f"Want {math.ceil(split_image_count)} validation images having "
+        f"[class1,class2,class3,class4] totals exceeding {target_counts}"
+    )
+
+    itmes_A = image_vectors
+    print(len(itmes_A))
+    items_B = []
+    for i in range(10):
+        next_choice = itmes_A.pop(random.randint(0,len(itmes_A)-1))
+        items_B.append(next_choice)
+        for x in range(4):
+            sums[x] -= next_choice[1][x]
+    
+    valid_sum = sum_dataset(items_B)
+    
+    progress = get_progress(valid_sum, even_split_goal)
+    remaining = split_image_count - 10
+    while min(progress) < 1.0 or remaining > 0:
+        direction = progress.index(min(progress))
+        
+        itmes_A = sorted(itmes_A, key=lambda x: x[1][direction], reverse=True)
+        next_choice = itmes_A.pop(random.randint(0,sums[direction]-1))
+        items_B.append(next_choice)
+        for x in range(4):
+            sums[x] -= next_choice[1][x]
+            valid_sum[x] += next_choice[1][x]
+        remaining -= 1
+        progress = get_progress(valid_sum, even_split_goal)
+
+    print("Random Dataset Split Totals:")
+    print(f"\tvalidation dataset {len(items_B)} items, class totals: {sum_dataset(items_B)}")
+    print(f"\ttraining dataset {len(itmes_A)} items, class totals: {sum_dataset(itmes_A)}")
+
+    return items_B
+
 if __name__=='__main__':
     args = parse_cmd()
 
@@ -361,64 +596,19 @@ if __name__=='__main__':
         print("No data path specified, exiting")
         quit()
     data_path = Path("/".join([args.data_path, 'train']))
-    
-    training_dataset = ImageDataset(str(data_path))
-    image, target = training_dataset[0]
-    print(type(image), image.shape, image.dtype)
-    for k, v in target.items():
-        if isinstance(v, torch.Tensor):
-            print(k, v.shape, v.dtype)
-        else:
-            print(k, type(v), v)
-    
-    
-    image_vectors = get_dataset_statistics(training_dataset)
-    sums = sum_dataset(image_vectors)
-    even_split_goal = []
-    for i in range(4):
-        even_split_goal.append(sums[i] * args.validation_ratio)
-    
-    val_image_count = len(training_dataset) * args.validation_ratio
-    print(f"Want { \
-        math.ceil(val_image_count)} validation images having [class1,class2,class3,class4] totals exceeding {[math.floor(t) for t in even_split_goal]}")
 
-    training_items = image_vectors
-    print(len(training_items))
-    validation_items = []
-    for i in range(10):
-        next_choice = training_items.pop(random.randint(0,len(training_items)-1))
-        validation_items.append(next_choice)
-        for x in range(4):
-            sums[x] -= next_choice[1][x]
-    
-    valid_sum = sum_dataset(validation_items)
-    
-    progress = get_progress(valid_sum, even_split_goal)
-    remaining = val_image_count - 10
-    while min(progress) < 1.0 or remaining > 0:
-        direction = progress.index(min(progress))
-        
-        training_items = sorted(training_items, key=lambda x: x[1][direction], reverse=True)
-        next_choice = training_items.pop(random.randint(0,sums[direction]-1))
-        validation_items.append(next_choice)
-        for x in range(4):
-            sums[x] -= next_choice[1][x]
-            valid_sum[x] += next_choice[1][x]
-        remaining -= 1
-        progress = get_progress(valid_sum, even_split_goal)
-
-    print("Random Dataset Split Totals:")
-    print(f"\tvalidation dataset {len(validation_items)} items, class totals: {sum_dataset(validation_items)}")
-    print(f"\ttraining dataset {len(training_items)} items, class totals: {sum_dataset(training_items)}")
+    training_dataset = ImageDataset(
+        str(data_path),
+        crop_size=512,
+        random_crop=True,
+        crop_trials=10,
+        min_instances_in_crop=1,
+    )
+    validation_items = get_balanced_dataset_split(data_path, args.validation_ratio)
     validation_dataset = training_dataset.split(validation_items)
-
-    # print("Validation Dataset Statistics")
-    # get_dataset_statistics(validation_dataset)
-    # print("Training Dataset Statistics")
-    # get_dataset_statistics(training_dataset)
-
-    #print(len(training_dataset) + len(validation_dataset))
-
+    validation_dataset.random_crop = False
+    validation_dataset.crop_trials = 1
+    validation_dataset.min_instances_in_crop = 0
 
     model = get_instance_segmenter(5)
     model.to(device)
