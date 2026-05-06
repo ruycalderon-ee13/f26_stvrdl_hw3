@@ -508,7 +508,7 @@ def get_instance_segmenter(num_classes=5, image_size=512):
         weights_backbone=ResNet50_Weights.DEFAULT,
         num_classes=num_classes,
         trainable_backbone_layers=3,
-        min_size=1,
+        min_size=64,
         max_size=image_size,
         
         box_detections_per_img=300,
@@ -870,7 +870,7 @@ if __name__=='__main__':
     print("creating training loader")
     train_loader = DataLoader(
         training_dataset,
-        batch_size=1,
+        batch_size=4,
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn,
@@ -878,7 +878,7 @@ if __name__=='__main__':
     print("creating validation loader")
     val_loader = DataLoader(
         validation_dataset,
-        batch_size=1,
+        batch_size=4,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn,
