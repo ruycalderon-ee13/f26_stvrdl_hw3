@@ -825,7 +825,7 @@ def evaluate_coco_ap50(
 
     # With iouThrs=[0.50], stats[0] is AP averaged over the available IoU
     # thresholds, meaning AP50 here.
-    ap50 = float(coco_eval.stats[0])
+    ap50 = float(coco_eval.stats[1])
 
     print(f"Official COCOeval segm AP50: {ap50:.4f}")
 
@@ -895,15 +895,26 @@ if __name__=='__main__':
         )
 
         print(f"epoch={epoch}, train_loss={train_loss:.4f}")
+        if (epoch+1)%5 == 0:
+            val_ap50, coco_eval = evaluate_coco_ap50(
+                model=model,
+                data_loader=val_loader,
+                device=device,
+                num_classes=5,
+                mask_threshold=0.5,
+                score_threshold=0.05,
+                max_detections_per_image=300,
+            )
 
-        val_ap50, coco_eval = evaluate_coco_ap50(
-            model=model,
-            data_loader=val_loader,
-            device=device,
-            num_classes=5,
-            mask_threshold=0.5,
-            score_threshold=0.05,
-            max_detections_per_image=300,
-        )
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_mAP50": val_ap50,
+                },
+                f"/checkpoints/e_{epoch}_ap50_{round(val_ap50,2)}.pt",
+            )
 
         print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
