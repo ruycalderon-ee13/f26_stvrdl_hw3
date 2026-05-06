@@ -917,4 +917,4 @@ if __name__=='__main__':
                 f"/checkpoints/e_{epoch}_ap50_{round(val_ap50,2)}.pt",
             )
 
-        print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
+            print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
