@@ -98,6 +98,31 @@ def parse_cmd():
     return parser.parse_args()
 
 
+def pad_image_and_masks_to_size(image, masks, target_h, target_w):
+    """
+    image: Tensor [C, H, W]
+    masks: Tensor [N, H, W]
+
+    Pads on the bottom and right only.
+    """
+    _, h, w = image.shape
+
+    pad_h = target_h - h
+    pad_w = target_w - w
+
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError("Target pad size is smaller than image/mask size.")
+
+    # pad format: (left, right, top, bottom)
+    image = func.pad(image, (0, pad_w, 0, pad_h), value=0.0)
+
+    if masks.shape[0] > 0:
+        masks = func.pad(masks, (0, pad_w, 0, pad_h), value=0)
+    else:
+        masks = torch.zeros((0, target_h, target_w), dtype=torch.uint8)
+
+    return image, masks
+
 class ImageDataset(Dataset):
     def __init__(
         self,
@@ -150,6 +175,7 @@ class ImageDataset(Dataset):
             class_mask_maps[class_name] = rle_read_maskfile(class_mask_path)
 
         return class_mask_maps
+    
 
     def _get_crop_hw(self, orig_h, orig_w):
         crop_h = min(self.crop_size, orig_h)
@@ -181,7 +207,7 @@ class ImageDataset(Dataset):
             total_instances += len(instance_ids)
 
         return total_instances
-
+    
     def _choose_crop_box(self, orig_h, orig_w, class_mask_maps):
         """
         Try a few crop candidates and prefer one containing at least
@@ -304,6 +330,17 @@ class ImageDataset(Dataset):
                 area = torch.zeros((0,), dtype=torch.float32)
 
             iscrowd = torch.zeros((masks.shape[0],), dtype=torch.int64)
+        
+        if self.crop_size is not None:
+            image, masks = pad_image_and_masks_to_size(
+                image=image,
+                masks=masks,
+                target_h=self.crop_size,
+                target_w=self.crop_size,
+            )
+
+            crop_h = self.crop_size
+            crop_w = self.crop_size
 
         target = {
             "boxes": boxes,
@@ -508,7 +545,7 @@ def get_instance_segmenter(num_classes=5, image_size=512):
         weights_backbone=ResNet50_Weights.DEFAULT,
         num_classes=num_classes,
         trainable_backbone_layers=3,
-        min_size=64,
+        min_size=image_size,
         max_size=image_size,
         
         box_detections_per_img=300,
@@ -655,6 +692,28 @@ def binary_mask_to_coco_rle(mask):
 
     return rle
 
+def pad_image_and_masks_to_size(image, masks, target_h, target_w):
+    """
+    image: Tensor [C, H, W]
+    masks: Tensor [N, H, W]
+    """
+    _, h, w = image.shape
+
+    pad_h = target_h - h
+    pad_w = target_w - w
+
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError("Target pad size is smaller than image size.")
+
+    # pad format is (left, right, top, bottom)
+    image = func.pad(image, (0, pad_w, 0, pad_h), value=0.0)
+
+    if masks.shape[0] > 0:
+        masks = func.pad(masks, (0, pad_w, 0, pad_h), value=0)
+    else:
+        masks = torch.zeros((0, target_h, target_w), dtype=torch.uint8)
+
+    return image, masks
 
 def build_coco_gt_from_targets(all_targets, num_classes=5):
     """
@@ -857,7 +916,7 @@ if __name__=='__main__':
     validation_dataset.min_instances_in_crop = 0
 
     print("creating model")
-    model = get_instance_segmenter(5, 512)
+    model = get_instance_segmenter(5, args.crop_size)
     model.to(device)
 
     print("creating optimizer")
@@ -914,7 +973,7 @@ if __name__=='__main__':
                     "train_loss": train_loss,
                     "val_mAP50": val_ap50,
                 },
-                f"/checkpoints/e_{epoch}_ap50_{round(val_ap50,2)}.pt",
+                f"checkpoints/e_{epoch}_ap50_{val_ap50:.2f}.pt",
             )
 
             print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
