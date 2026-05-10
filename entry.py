@@ -95,8 +95,73 @@ def parse_cmd():
         help="image crop size (memory constraint)"
     )
 
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to trained checkpoint for inference",
+    )
+
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="test-results.json",
+        help="Output JSON path for CodaBench submission",
+    )
+
+    parser.add_argument(
+        "--score_threshold",
+        type=float,
+        default=0.05,
+        help="Minimum prediction score to keep",
+    )
+
+    parser.add_argument(
+        "--mask_threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for converting soft masks to binary masks",
+    )
+
     return parser.parse_args()
 
+def load_test_image_id_map(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    # Expected from slides:
+    # [
+    #   {"file_name": "...tif", "id": 1, "height": ..., "width": ...},
+    #   ...
+    # ]
+    if isinstance(data, list):
+        return {item["file_name"]: item for item in data}
+
+    # Backup case: already a dict.
+    return data
+
+def pil_to_model_tensor_padded(img, crop_size):
+    """
+    img: PIL RGB image, possibly smaller than crop_size x crop_size.
+    returns: Tensor [3, crop_size, crop_size]
+    """
+    image = tfunc2.to_dtype(
+        tfunc2.to_image(img),
+        dtype=torch.float32,
+        scale=True,
+    )
+
+    _, h, w = image.shape
+
+    pad_h = crop_size - h
+    pad_w = crop_size - w
+
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError("Tile is larger than crop_size.")
+
+    image = func.pad(image, (0, pad_w, 0, pad_h), value=0.0)
+
+    return image
 
 def pad_image_and_masks_to_size(image, masks, target_h, target_w):
     """
@@ -393,6 +458,75 @@ def move_target_to_device(target, device):
 
     return moved
 
+@torch.inference_mode()
+def infer_one_image_tiled(
+    model,
+    image_path,
+    image_id,
+    device,
+    crop_size=512,
+    score_threshold=0.05,
+    mask_threshold=0.5,
+    min_mask_area=4,
+):
+    model.eval()
+
+    results = []
+
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        width, height = img.size
+
+        x_starts = list(range(0, width, crop_size))
+        y_starts = list(range(0, height, crop_size))
+
+        for y0 in y_starts:
+            for x0 in x_starts:
+                x1 = min(x0 + crop_size, width)
+                y1 = min(y0 + crop_size, height)
+
+                tile = img.crop((x0, y0, x1, y1))
+                tile_w, tile_h = tile.size
+
+                tile_tensor = pil_to_model_tensor_padded(
+                    tile,
+                    crop_size=crop_size,
+                ).to(device)
+
+                output = model([tile_tensor])[0]
+
+                scores = output["scores"].detach().cpu()
+                labels = output["labels"].detach().cpu()
+                masks = output["masks"].detach().cpu()[:, 0] >= mask_threshold
+
+                keep = scores >= score_threshold
+
+                scores = scores[keep]
+                labels = labels[keep]
+                masks = masks[keep]
+
+                for pred_idx in range(scores.shape[0]):
+                    # Remove padded region from edge tiles.
+                    tile_mask = masks[pred_idx][:tile_h, :tile_w]
+
+                    if int(tile_mask.sum()) < min_mask_area:
+                        continue
+
+                    full_mask = np.zeros((height, width), dtype=np.uint8)
+                    full_mask[y0:y1, x0:x1] = tile_mask.numpy().astype(np.uint8)
+
+                    rle = binary_mask_to_coco_rle(full_mask)
+
+                    results.append(
+                        {
+                            "image_id": int(image_id),
+                            "category_id": int(labels[pred_idx]),
+                            "segmentation": rle,
+                            "score": float(scores[pred_idx]),
+                        }
+                    )
+
+    return results
 
 def train_one_epoch(model, data_loader, optimizer, device, epoch):
     model.train()
@@ -425,6 +559,58 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch):
 
     return running_loss / len(data_loader)
 
+def run_test_inference(
+    model,
+    test_dir,
+    image_id_json_path,
+    output_path,
+    device,
+    crop_size=512,
+    score_threshold=0.05,
+    mask_threshold=0.5,
+):
+    image_id_map = load_test_image_id_map(image_id_json_path)
+
+    all_results = []
+
+    test_filenames = sorted(
+        [
+            f for f in os.listdir(test_dir)
+            if f.lower().endswith(".tif")
+        ]
+    )
+
+    for idx, file_name in enumerate(test_filenames):
+        image_path = os.path.join(test_dir, file_name)
+
+        if file_name not in image_id_map:
+            raise KeyError(f"{file_name} not found in image id map.")
+
+        image_id = image_id_map[file_name]["id"]
+
+        print(
+            f"[{idx + 1}/{len(test_filenames)}] "
+            f"infer {file_name}, image_id={image_id}"
+        )
+
+        image_results = infer_one_image_tiled(
+            model=model,
+            image_path=image_path,
+            image_id=image_id,
+            device=device,
+            crop_size=crop_size,
+            score_threshold=score_threshold,
+            mask_threshold=mask_threshold,
+        )
+
+        print(f"\tkept predictions: {len(image_results)}")
+
+        all_results.extend(image_results)
+
+    with open(output_path, "w") as f:
+        json.dump(all_results, f)
+
+    print(f"Saved {len(all_results)} predictions to {output_path}")
 
 def get_dataset_statistics(dataset):
     print(f"Gathering LIGHT dataset statistics for dataset of size {len(dataset)}")
@@ -902,78 +1088,106 @@ if __name__=='__main__':
     print(f"training with {args.training_epochs} epochs")
     print(f"training with crop size of {args.crop_size}^2 px ")
 
-    training_dataset = ImageDataset(
-        str(data_path),
-        crop_size=args.crop_size,
-        random_crop=True,
-        crop_trials=10,
-        min_instances_in_crop=1,
-    )
-    validation_items = get_balanced_dataset_split(data_path, args.validation_ratio)
-    validation_dataset = training_dataset.split(validation_items)
-    validation_dataset.random_crop = False
-    validation_dataset.crop_trials = 1
-    validation_dataset.min_instances_in_crop = 0
+    if args.mode == RunMode.INFER:
+        if args.checkpoint is None:
+            raise ValueError("Please provide --checkpoint for inference.")
 
-    print("creating model")
-    model = get_instance_segmenter(5, args.crop_size)
-    model.to(device)
+        test_dir = Path(args.data_path) / "test_release"
+        image_id_json_path = Path(args.data_path) / "test_image_name_to_ids.json"
 
-    print("creating optimizer")
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=1e-4,
-        weight_decay=1e-4,
-    )
+        print("creating model")
+        model = get_instance_segmenter(5, args.crop_size)
 
-    print("creating training loader")
-    train_loader = DataLoader(
-        training_dataset,
-        batch_size=4,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-    print("creating validation loader")
-    val_loader = DataLoader(
-        validation_dataset,
-        batch_size=4,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
+        print(f"loading checkpoint: {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
 
-    print("beginning training")
-    for epoch in range(args.training_epochs):
-        train_loss = train_one_epoch(
+        model.to(device)
+        model.eval()
+
+        run_test_inference(
             model=model,
-            data_loader=train_loader,
-            optimizer=optimizer,
+            test_dir=str(test_dir),
+            image_id_json_path=str(image_id_json_path),
+            output_path=args.output_path,
             device=device,
-            epoch=epoch,
+            crop_size=args.crop_size,
+            score_threshold=args.score_threshold,
+            mask_threshold=args.mask_threshold,
+        )
+    else:
+        training_dataset = ImageDataset(
+            str(data_path),
+            crop_size=args.crop_size,
+            random_crop=True,
+            crop_trials=10,
+            min_instances_in_crop=1,
+        )
+        validation_items = get_balanced_dataset_split(data_path, args.validation_ratio)
+        validation_dataset = training_dataset.split(validation_items)
+        validation_dataset.random_crop = False
+        validation_dataset.crop_trials = 1
+        validation_dataset.min_instances_in_crop = 0
+
+        print("creating model")
+        model = get_instance_segmenter(5, args.crop_size)
+        model.to(device)
+
+        print("creating optimizer")
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=1e-4,
+            weight_decay=1e-4,
         )
 
-        print(f"epoch={epoch}, train_loss={train_loss:.4f}")
-        if (epoch+1)%5 == 0:
-            val_ap50, coco_eval = evaluate_coco_ap50(
+        print("creating training loader")
+        train_loader = DataLoader(
+            training_dataset,
+            batch_size=4,
+            shuffle=True,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+        print("creating validation loader")
+        val_loader = DataLoader(
+            validation_dataset,
+            batch_size=4,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+
+        print("beginning training")
+        for epoch in range(args.training_epochs):
+            train_loss = train_one_epoch(
                 model=model,
-                data_loader=val_loader,
+                data_loader=train_loader,
+                optimizer=optimizer,
                 device=device,
-                num_classes=5,
-                mask_threshold=0.5,
-                score_threshold=0.05,
-                max_detections_per_image=300,
+                epoch=epoch,
             )
 
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_mAP50": val_ap50,
-                },
-                f"checkpoints/e_{epoch}_ap50_{val_ap50:.2f}.pt",
-            )
+            print(f"epoch={epoch}, train_loss={train_loss:.4f}")
+            if (epoch+1)%5 == 0:
+                val_ap50, coco_eval = evaluate_coco_ap50(
+                    model=model,
+                    data_loader=val_loader,
+                    device=device,
+                    num_classes=5,
+                    mask_threshold=0.5,
+                    score_threshold=0.05,
+                    max_detections_per_image=300,
+                )
 
-            print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "val_mAP50": val_ap50,
+                    },
+                    f"checkpoints/e_{epoch}_ap50_{val_ap50:.2f}.pt",
+                )
+
+                print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
