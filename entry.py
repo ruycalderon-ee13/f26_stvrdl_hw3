@@ -1087,7 +1087,7 @@ if __name__=='__main__':
     data_path = Path("/".join([args.data_path, 'train']))
     print(f"training with {args.training_epochs} epochs")
     print(f"training with crop size of {args.crop_size}^2 px ")
-
+    
     if args.mode == RunMode.INFER:
         if args.checkpoint is None:
             raise ValueError("Please provide --checkpoint for inference.")
@@ -1157,6 +1157,8 @@ if __name__=='__main__':
             collate_fn=collate_fn,
         )
 
+        losses = []
+        accuracies = []
         print("beginning training")
         for epoch in range(args.training_epochs):
             train_loss = train_one_epoch(
@@ -1166,6 +1168,7 @@ if __name__=='__main__':
                 device=device,
                 epoch=epoch,
             )
+            losses.append(train_loss)
 
             print(f"epoch={epoch}, train_loss={train_loss:.4f}")
             if (epoch+1)%5 == 0:
@@ -1178,6 +1181,7 @@ if __name__=='__main__':
                     score_threshold=0.05,
                     max_detections_per_image=300,
                 )
+                accuracies.append(val_ap50)
 
                 torch.save(
                     {
@@ -1191,3 +1195,14 @@ if __name__=='__main__':
                 )
 
                 print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
+            else:
+                accuracies.append(0 if len(accuracies) == 0 else accuracies[-1])
+
+        out = "epoch,train_loss,val_ap50\n" + "\n".join(
+            [
+                f"{i},{losses[i]},{accuracies[i]}"
+                for i in range(args.training_epochs)
+            ]
+        )
+
+        print(out)
