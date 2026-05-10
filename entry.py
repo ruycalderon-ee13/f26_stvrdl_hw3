@@ -1078,7 +1078,7 @@ def evaluate_coco_ap50(
 
 if __name__=='__main__':
     args = parse_cmd()
-
+    random.seed()
     device, device_string = init_device()
     print(f"Using {device_string} backend ")
     if args.data_path == None:
@@ -1191,7 +1191,7 @@ if __name__=='__main__':
                         "train_loss": train_loss,
                         "val_mAP50": val_ap50,
                     },
-                    f"checkpoints/e_{epoch}_ap50_{val_ap50:.2f}.pt",
+                    f"../checkpoints/e_{epoch}_ap50_{val_ap50:.2f}.pt",
                 )
 
                 print(f"epoch={epoch}, official_val_AP50={val_ap50:.4f}")
