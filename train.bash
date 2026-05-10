@@ -1,1 +1,1 @@
-python ./entry.py --mode=train --data_path=../hw3-data-release --validation_ratio=0.2 --training_epochs=15 --crop_size=512
+python ./entry.py --mode=train --data_path=../hw3-data-release --validation_ratio=0.2 --training_epochs=15 --crop_size=384
