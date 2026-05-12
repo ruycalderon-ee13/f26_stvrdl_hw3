@@ -517,10 +517,14 @@ def infer_one_image_tiled(
 
                     rle = binary_mask_to_coco_rle(full_mask)
 
+                    bbox = mask_utils.toBbox(rle).tolist()
+                    bbox = [float(x) for x in bbox]
+                    
                     results.append(
                         {
                             "image_id": int(image_id),
                             "category_id": int(labels[pred_idx]),
+                            "bbox": bbox,
                             "segmentation": rle,
                             "score": float(scores[pred_idx]),
                         }
